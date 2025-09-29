@@ -1,4 +1,6 @@
-*/__pycache__
+__pycache__
+.idea/
 output
+input
 cache
 third_party
