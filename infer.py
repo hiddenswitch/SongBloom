@@ -73,7 +73,7 @@ def main():
         if sr != model.sample_rate:
             prompt_wav = torchaudio.functional.resample(prompt_wav, sr, model.sample_rate)
         prompt_wav = prompt_wav.mean(dim=0, keepdim=True).to(model.dtype)
-        prompt_wav = prompt_wav[..., :min(int(args.reference_seconds * model.sample_rate), 10)]
+        prompt_wav = prompt_wav[..., :min(int(args.reference_seconds * model.sample_rate), 10 * model.sample_rate)]
         # breakpoint()
         fname = f"{idx}_s"
         for i in range(args.n_samples):
