@@ -1,18 +1,18 @@
 import os, sys
+
+import lightning
+import lightning.fabric.accelerators
 import torch, torchaudio
 import argparse
 import json
 import re
+
+from lightning import Fabric
 from omegaconf import MISSING, OmegaConf, DictConfig
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from pathlib import Path
 
 from SongBloom.models.songbloom.songbloom_pl import SongBloom_Sampler
-
-NAME2REPO = {
-    "songbloom_full_150s": "CypressYang/SongBloom",
-    "songbloom_full_150s_dpo": "CypressYang/SongBloom"
-}
 
 
 def load_config(cfg_file, parent_dir="./") -> DictConfig:
@@ -31,43 +31,30 @@ def load_config(cfg_file, parent_dir="./") -> DictConfig:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", type=str, default="songbloom_full_150s")
-    parser.add_argument("--local-dir", type=str, default="./cache")
+    parser.add_argument("--model-name", type=str, default="songbloom_full_150s",
+                        choices=["songbloom_full_150s", "songbloom_full_150s_dpo"])
     parser.add_argument("--input-jsonl", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="./output")
-    parser.add_argument("--n-samples", type=int, default=2)
-    parser.add_argument("--dtype", type=str, default='float32', choices=['float32', 'bfloat16'])
+    parser.add_argument("--n-samples", type=int, default=1)
+    parser.add_argument("--dtype", type=str, default="bf16-true", help="lightning fabric precisions, not dtypes")
     parser.add_argument("--cfg", type=float, default=1.5)
-
+    parser.add_argument("--device", type=str, default='auto')
+    parser.add_argument("--compile", type=bool, default=True)
     args = parser.parse_args()
 
+    fabric = Fabric(accelerator=args.device, precision=args.dtype)
+    # prepare output path
+    Path(args.output_dir).mkdir(exist_ok=True, parents=True)
+
     model_name = args.model_name
-    repo_id = NAME2REPO[model_name]
-
-    kwargs = {}
-    cfg_path = hf_hub_download(
-        repo_id=repo_id, filename=f"{model_name}.yaml", **kwargs)
-    ckpt_path = hf_hub_download(
-        repo_id=repo_id, filename=f"{model_name}.pt", **kwargs)
-
-    vae_cfg_path = hf_hub_download(
-        repo_id="CypressYang/SongBloom", filename="stable_audio_1920_vae.json", **kwargs)
-    vae_ckpt_path = hf_hub_download(
-        repo_id="CypressYang/SongBloom", filename="autoencoder_music_dsp1920.ckpt", **kwargs)
-
-    g2p_path = hf_hub_download(
-        repo_id="CypressYang/SongBloom", filename="vocab_g2p.yaml", **kwargs)
-
+    repo = Path(snapshot_download("CypressYang/SongBloom"))
+    cfg_path = repo / f"{model_name}.yaml"
     cfg = load_config(cfg_path, parent_dir=str(Path(cfg_path).parent))
-
     cfg.max_dur = cfg.max_dur + 20
 
-    dtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-    model = SongBloom_Sampler.build_from_trainer(cfg, strict=True, dtype=dtype)
+    model = SongBloom_Sampler.build_from_trainer(cfg, strict=True, fabric=fabric, compile=args.compile)
     cfg.inference.cfg_coef = args.cfg
     model.set_generation_params(**cfg.inference)
-
-    os.makedirs(args.output_dir, exist_ok=True)
 
     input_lines = open(args.input_jsonl, 'r').readlines()
     input_lines = [json.loads(l.strip()) for l in input_lines]
@@ -77,12 +64,12 @@ def main():
         idx, lyrics, prompt_wav = test_sample["idx"], test_sample["lyrics"], test_sample["prompt_wav"]
 
         lyrics = re.sub(r'\((.*?):(\d+)\)', lambda m: ' '.join([m.group(1).strip()] * int(m.group(2))), lyrics)
-        seconds = len(lyrics.split(" "))
 
         prompt_wav, sr = torchaudio.load(prompt_wav)
         if sr != model.sample_rate:
             prompt_wav = torchaudio.functional.resample(prompt_wav, sr, model.sample_rate)
-        prompt_wav = prompt_wav.mean(dim=0, keepdim=True).to(dtype)
+        prompt_wav = prompt_wav.mean(dim=0, keepdim=True).to(model.dtype)
+        # todo: this only really works with 10s
         # prompt_wav = prompt_wav[..., :10*model.sample_rate]
         # breakpoint()
         fname = f"{idx}_s"

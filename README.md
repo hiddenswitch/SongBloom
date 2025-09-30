@@ -42,12 +42,9 @@ Experimental results demonstrate that SongBloom outperforms existing methods acr
 ### Prepare Environments
 
 ```bash
-conda create -n SongBloom python==3.8.12
-conda activate SongBloom
-
-# yum install libsndfile
-# pip install torch==2.2.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu118 # For different CUDA version
-pip install -r requirements.txt
+uv venv
+uv pip install --torch-backend=auto -e .
+source .venv/bin/activate
 ```
 
 ### Data Preparation
@@ -55,11 +52,7 @@ pip install -r requirements.txt
 A  .jsonl file, where each line is a json object:
 
 ```json
-{
-	"idx": "The index of each sample", 
-	"lyrics": "The lyrics to be generated",
-	"prompt_wav": "The path of the style prompt audio",
-}
+{"idx": "The index of each sample", "lyrics": "([intro]:8) 8 seconds of intro, then lyrics to be generated, followed by instrumental for 8 seconds by writing ([inst]:8), more lyrics", "prompt_wav": "The path of the style prompt audio"}
 ```
 
 One example can be refered to as: [example/test.jsonl](example/test.jsonl)
@@ -79,7 +72,7 @@ python3 infer.py --input-jsonl example/test.jsonl
 # For GPUs with low VRAM like RTX4090, you should set the dtype as bfloat16
 python3 infer.py --input-jsonl example/test.jsonl --dtype bfloat16
 
-# SongBloom also supports flash-attn (optional). To enable it, please install flash-attn (v2.6.3 is used during training) manually and set os.environ['DISABLE_FLASH_ATTN'] = "0" in infer.py:8
+# SongBloom also supports flash-attn (optional). To enable it, please install flash-attn
 ```
 
 - model-name: Specify model version, see the model cards (eg: songbloom_full_150s/songbloom_full_150s_dpo);

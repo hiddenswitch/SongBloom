@@ -1,8 +1,8 @@
-
 from functools import partial
 import typing as tp
 import torch
 import torch.nn as nn
+from lightning import Fabric
 from torch.nn import functional as F
 import torchaudio
 import numpy as np
@@ -17,7 +17,6 @@ from ..musicgen.conditioners import WavCondition, JointEmbedCondition, Condition
 from ..vae_frontend import StableVAE
 from .songbloom_mvsa import MVSA_DiTAR
 from ...g2p.lyric_common import key2processor, symbols, LABELS
-
 
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
@@ -34,45 +33,39 @@ class SongBloom_PL(pl.LightningModule):
         self.vae = StableVAE(**cfg.vae).eval()
         assert self.cfg.model['latent_dim'] == self.vae.channel_dim
 
-            
         self.save_hyperparameters(cfg)
         if self.vae is not None:
             for param in self.vae.parameters():
                 param.requires_grad = False
-                
+
         # Build DiT
         model_cfg = OmegaConf.to_container(copy.deepcopy(cfg.model), resolve=True)
         for cond_name in model_cfg["condition_provider_cfg"]:
             if model_cfg["condition_provider_cfg"][cond_name]['type'] == 'audio_tokenizer_wrapper':
                 model_cfg["condition_provider_cfg"][cond_name]["audio_tokenizer"] = self.vae
                 model_cfg["condition_provider_cfg"][cond_name]["cache"] = False
-        
-        
+
         self.model = MVSA_DiTAR(**model_cfg)
         # print(self.model)
-        
-
-
-
 
 
 ####################################
 
-class SongBloom_Sampler:    
-    
+class SongBloom_Sampler:
+
     def __init__(self, compression_model: StableVAE, diffusion: MVSA_DiTAR, lyric_processor_key,
                  max_duration: float, prompt_duration: tp.Optional[float] = None):
         self.compression_model = compression_model
         self.diffusion = diffusion
         self.lyric_processor_key = lyric_processor_key
-        self.lyric_processor = key2processor.get(lyric_processor_key) if lyric_processor_key is not None else lambda x: x
+        self.lyric_processor = key2processor.get(lyric_processor_key) if lyric_processor_key is not None else lambda \
+                x: x
         # import pdb; pdb.set_trace()
 
         assert max_duration is not None
         self.max_duration: float = max_duration
         self.prompt_duration = prompt_duration
-        
-        
+
         self.device = next(iter(diffusion.parameters())).device
         self.generation_params: dict = {}
         # self.set_generation_params(duration=15)  # 15 seconds by default
@@ -81,26 +74,31 @@ class SongBloom_Sampler:
         self._progress_callback: tp.Optional[tp.Callable[[int, int], None]] = None
 
     @classmethod
-    def build_from_trainer(cls, cfg, strict=True, dtype=torch.float32):
-        model_light = SongBloom_PL(cfg)
-        incompatible = model_light.load_state_dict(torch.load(cfg.pretrained_path, map_location='cpu'), strict=strict)
-        
+    def build_from_trainer(cls, cfg, fabric: Fabric, strict=True, compile: bool = True):
+        # todo: this should really use empty_weight_init from accelerate
+        with fabric.init_module(empty_init=True):
+            model_light = SongBloom_PL(cfg)
+
+        incompatible = model_light.load_state_dict(torch.load(cfg.pretrained_path), strict=strict)
+        if compile:
+            model_light = torch.compile(model_light)
+        fabric.setup(model_light, move_to_device=True)
         lyric_processor_key = cfg.train_dataset.lyric_processor
-    
+
         print(incompatible)
-        
-        model_light = model_light.eval().cuda().to(dtype=dtype)  
+
+        model_light = model_light.eval()
         model = cls(
-            compression_model = model_light.vae,
-            diffusion = model_light.model,
-            lyric_processor_key = lyric_processor_key,
-            max_duration = cfg.max_dur,
-            prompt_duration = cfg.sr * cfg.train_dataset.prompt_len
-            
+            compression_model=model_light.vae,
+            diffusion=model_light.model,
+            lyric_processor_key=lyric_processor_key,
+            max_duration=cfg.max_dur,
+            prompt_duration=cfg.sr * cfg.train_dataset.prompt_len
+
         )
         model.set_generation_params(**cfg.inference)
         return model
-        
+
     @property
     def frame_rate(self) -> float:
         """Roughly the number of AR steps per seconds."""
@@ -111,10 +109,13 @@ class SongBloom_Sampler:
         """Sample rate of the generated audio."""
         return self.compression_model.sample_rate
 
-
     def set_generation_params(self, **kwargs):
         """Set the generation parameters."""
         self.generation_params.update(kwargs)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.compression_model.vae.parameters()).dtype
 
     # Mulan Inference
     @torch.no_grad()
@@ -125,18 +126,18 @@ class SongBloom_Sampler:
         assert prompt_wav.ndim == 2
         if self.prompt_duration is not None:
             prompt_wav = prompt_wav[..., :self.prompt_duration]
-            
-        attributes, _ = self._prepare_tokens_and_attributes(conditions={"lyrics": [self._process_lyric(lyrics)], "prompt_wav": [prompt_wav]}, 
-                                                                        prompt=None, prompt_tokens=None)
+
+        attributes, _ = self._prepare_tokens_and_attributes(
+            conditions={"lyrics": [self._process_lyric(lyrics)], "prompt_wav": [prompt_wav]},
+            prompt=None, prompt_tokens=None)
 
         # breakpoint()
         print(self.generation_params)
         latent_seq, token_seq = self.diffusion.generate(None, attributes, **self.generation_params)
         # print(token_seq)
         audio_recon = self.compression_model.decode(latent_seq).float()
-        
+
         return audio_recon
-    
 
     def _process_lyric(self, input_lyric):
         if self.lyric_processor_key == 'pinyin':
@@ -149,9 +150,9 @@ class SongBloom_Sampler:
                     new = self.lyric_processor(check_lyric[ii])
                     check_lyric[ii] = new
             processed_lyric = " ".join(check_lyric)
-        
+
         return processed_lyric
-    
+
     @torch.no_grad()
     def _prepare_tokens_and_attributes(
             self,
@@ -180,13 +181,13 @@ class SongBloom_Sampler:
                             torch.zeros((1, 1, 1), device=self.device),
                             torch.tensor([0], device=self.device).long(),
                             sample_rate=[self.sample_rate],
-                            path=[None])  
+                            path=[None])
                     else:
                         attr.wav[k] = WavCondition(
-                            cond.to(device=self.device).unsqueeze(0), # 1,C,T .mean(dim=0, keepdim=True)
+                            cond.to(device=self.device).unsqueeze(0),  # 1,C,T .mean(dim=0, keepdim=True)
                             torch.tensor([cond.shape[-1]], device=self.device).long(),
                             sample_rate=[self.sample_rate],
-                            path=[None])  
+                            path=[None])
                 elif self.diffusion.condition_provider.conditioner_type[k] == 'text':
                     attr.text[k] = cond
                 elif self.diffusion.condition_provider.conditioner_type[k] == 'joint_embed':
@@ -196,20 +197,20 @@ class SongBloom_Sampler:
                             [cond],
                             torch.tensor([0], device=self.device).long(),
                             sample_rate=[self.sample_rate],
-                            path=[None])  
+                            path=[None])
                     elif isinstance(cond, torch.Tensor):
                         attr.joint_embed[k] = JointEmbedCondition(
                             cond.to(device=self.device).mean(dim=0, keepdim=True).unsqueeze(0),
-                            [None], 
+                            [None],
                             torch.tensor([cond.shape[-1]], device=self.device).long(),
                             sample_rate=[self.sample_rate],
-                            path=[None])  
+                            path=[None])
                     else:
                         raise NotImplementedError
         assert conditions == {}, f"Find illegal conditions: {conditions}, support keys: {self.lm.condition_provider.conditioners}"
         # breakpoint()
         print(attributes)
-        
+
         if prompt_tokens is not None:
             prompt_tokens = prompt_tokens.to(self.device)
             assert prompt is None
@@ -221,4 +222,3 @@ class SongBloom_Sampler:
             prompt_tokens = None
 
         return attributes, prompt_tokens
-

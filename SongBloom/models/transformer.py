@@ -425,7 +425,7 @@ class Attention(nn.Module):
 
             causal = False
         
-        with torch.backends.cuda.sdp_kernel(**self.sdp_kwargs):
+        with torch.nn.attention.sdpa_kernel(**self.sdp_kwargs):
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask = mask,
