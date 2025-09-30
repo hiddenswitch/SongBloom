@@ -40,6 +40,10 @@ def main():
     parser.add_argument("--cfg", type=float, default=1.5)
     parser.add_argument("--device", type=str, default='auto')
     parser.add_argument("--compile", type=bool, default=True)
+    parser.add_argument("--reference-seconds", type=float, default=10.0,
+                        help="the number of seconds of the reference clip to use, up to 10.0")
+    parser.add_argument("--addl-max-duration-seconds", type=float, default=20,
+                        help="the additional number of seconds to add to the max duration of the configuration for this model")
     args = parser.parse_args()
 
     fabric = Fabric(accelerator=args.device, precision=args.dtype)
@@ -50,7 +54,7 @@ def main():
     repo = Path(snapshot_download("CypressYang/SongBloom"))
     cfg_path = repo / f"{model_name}.yaml"
     cfg = load_config(cfg_path, parent_dir=str(Path(cfg_path).parent))
-    cfg.max_dur = cfg.max_dur + 20
+    cfg.max_dur = cfg.max_dur + int(args.addl_max_duration_seconds)
 
     model = SongBloom_Sampler.build_from_trainer(cfg, strict=True, fabric=fabric, compile=args.compile)
     cfg.inference.cfg_coef = args.cfg
@@ -69,8 +73,7 @@ def main():
         if sr != model.sample_rate:
             prompt_wav = torchaudio.functional.resample(prompt_wav, sr, model.sample_rate)
         prompt_wav = prompt_wav.mean(dim=0, keepdim=True).to(model.dtype)
-        # todo: this only really works with 10s
-        # prompt_wav = prompt_wav[..., :10*model.sample_rate]
+        prompt_wav = prompt_wav[..., :min(int(args.reference_seconds * model.sample_rate), 10)]
         # breakpoint()
         fname = f"{idx}_s"
         for i in range(args.n_samples):
